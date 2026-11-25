@@ -1,0 +1,31 @@
+# Reusable CI for the "dotnet" stack of the repo contract (Egoushka/workspace: docs/specs/2026-11-25-repo-contract.md).
+# Callers are rendered by `ws repos apply`; do not copy this file. PR gate: an owner PR is gated by the `fast-tier` status
+# `ws ship` posts, so the job runs only on fork and bot PRs, on workflow_dispatch (the merge train's train/* branch) and on
+# the nightly run. runs-on follows the repo variable CI_RUNS_ON (the nickel pool), never GitHub-hosted minutes on a private repo.
+name: dotnet
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        type: string
+        default: "."
+permissions:
+  contents: read
+jobs:
+  dotnet:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork || github.event.pull_request.user.type == 'Bot'
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '"ubuntu-24.04"') }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          global-json-file: ${{ inputs.working-directory }}/global.json
+      - run: dotnet restore
+      - run: dotnet build --no-restore -c Release -warnaserror
+      - run: dotnet test --no-build -c Release

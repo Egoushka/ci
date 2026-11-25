@@ -1,0 +1,34 @@
+# Reusable CI for the "node" stack of the repo contract (Egoushka/workspace: docs/specs/2026-11-25-repo-contract.md).
+# Callers are rendered by `ws repos apply`; do not copy this file. PR gate: an owner PR is gated by the `fast-tier` status
+# `ws ship` posts, so the job runs only on fork and bot PRs, on workflow_dispatch (the merge train's train/* branch) and on
+# the nightly run. runs-on follows the repo variable CI_RUNS_ON (the nickel pool), never GitHub-hosted minutes on a private repo.
+name: node
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        type: string
+        default: "."
+      node-version:
+        type: string
+        default: "24"
+permissions:
+  contents: read
+jobs:
+  node:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork || github.event.pull_request.user.type == 'Bot'
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '"ubuntu-24.04"') }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+      - run: npm ci
+      - run: npm test --if-present
+      - run: npm run build --if-present
