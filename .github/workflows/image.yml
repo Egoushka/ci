@@ -1,0 +1,120 @@
+# Reusable image release for private repos: builds a Dockerfile on nickel and pushes it to ghcr.io (Home Forge, 2026-11-25).
+# The pool job has no docker and is one uid under gVisor, so the build runs on the rootless BuildKit at 10.221.0.4
+# (Egoushka/homelab stacks/ci-buildkit, docs/decisions/2026-11-25-ci-image-builder.md); this job is only the client.
+# runs-on is the repo variable CI_RUNS_ON (the nickel pool) and falls back to the pool, never to a hosted runner.
+#
+#   jobs:
+#     release:
+#       uses: Egoushka/ci/.github/workflows/image.yml@v1
+#       permissions: {contents: read, packages: write}
+#       with: {dockerfile: server/Dockerfile, version-file: server/package.json}
+#
+# A tag vX.Y.Z pushes ghcr.io/<owner>/<repo>:X.Y.Z (no `latest`); another ref pushes :<short sha> (set `push: false` to only build).
+# The digest is in the job summary and in the `digest` output.
+name: image
+on:
+  workflow_call:
+    inputs:
+      dockerfile:
+        type: string
+        default: Dockerfile
+      context:
+        type: string
+        default: .
+      image:
+        description: Image name without tag; default is ghcr.io/<owner>/<repo> lowercased.
+        type: string
+        default: ""
+      version-file:
+        description: A package.json whose version must equal the tag (leave empty to skip).
+        type: string
+        default: ""
+      build-args:
+        description: Newline-separated KEY=VALUE build args.
+        type: string
+        default: ""
+      push:
+        type: boolean
+        default: true
+    outputs:
+      digest:
+        value: ${{ jobs.image.outputs.digest }}
+      reference:
+        value: ${{ jobs.image.outputs.reference }}
+permissions:
+  contents: read
+jobs:
+  image:
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["self-hosted","nickel"]') }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      reference: ${{ steps.build.outputs.reference }}
+    env:
+      BUILDKIT_ADDR: tcp://10.221.0.4:1234
+      BUILDKIT_VERSION: v0.35.1
+      BUILDKIT_SHA256: b248c2b91698aafef11818fe8b681dc5e341581f7d5676709ff45ca1f29b0408
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Name the image
+        env:
+          IMAGE_IN: ${{ inputs.image }}
+          VERSION_FILE: ${{ inputs.version-file }}
+        run: |
+          set -eu
+          image="${IMAGE_IN:-ghcr.io/${GITHUB_REPOSITORY,,}}"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ -n "$VERSION_FILE" ]; then
+              version=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$VERSION_FILE" | head -1)
+              if [ "v$version" != "$GITHUB_REF_NAME" ]; then echo "tag $GITHUB_REF_NAME does not match $VERSION_FILE version $version" >&2; exit 1; fi
+            fi
+          else
+            tag="${GITHUB_SHA::7}"
+          fi
+          echo "REF=$image:$tag" >> "$GITHUB_ENV"
+      - name: buildctl (pinned and checksummed; the pool image has none)
+        run: |
+          set -eu
+          dir="$RUNNER_TEMP/buildkit"; mkdir -p "$dir"
+          curl -fsSL -o "$dir/bk.tgz" "https://github.com/moby/buildkit/releases/download/$BUILDKIT_VERSION/buildkit-$BUILDKIT_VERSION.linux-amd64.tar.gz"
+          echo "$BUILDKIT_SHA256  $dir/bk.tgz" | sha256sum -c -
+          tar -xzf "$dir/bk.tgz" -C "$dir" bin/buildctl
+          echo "$dir/bin" >> "$GITHUB_PATH"
+      - name: Build on nickel and push
+        id: build
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.context }}
+          BUILD_ARGS: ${{ inputs.build-args }}
+          PUSH: ${{ inputs.push }}
+        run: |
+          set -eu
+          export DOCKER_CONFIG="$RUNNER_TEMP/docker"; mkdir -p "$DOCKER_CONFIG"
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$(printf '%s:%s' "$ACTOR" "$TOKEN" | base64 -w0)" > "$DOCKER_CONFIG/config.json"
+          args=()
+          while IFS= read -r kv; do [ -n "$kv" ] && args+=(--opt "build-arg:$kv"); done <<< "$BUILD_ARGS"
+          meta="$RUNNER_TEMP/meta.json"
+          buildctl --addr "$BUILDKIT_ADDR" build \
+            --frontend dockerfile.v0 \
+            --local context="$CONTEXT" --local dockerfile="$(dirname "$DOCKERFILE")" \
+            --opt filename="$(basename "$DOCKERFILE")" --opt platform=linux/amd64 \
+            --opt label:org.opencontainers.image.source="https://github.com/$GITHUB_REPOSITORY" \
+            --opt label:org.opencontainers.image.revision="$GITHUB_SHA" \
+            --opt label:org.opencontainers.image.version="${REF##*:}" \
+            "${args[@]}" \
+            --output "type=image,name=$REF,push=$PUSH,oci-mediatypes=true" \
+            --metadata-file "$meta"
+          rm -rf "$DOCKER_CONFIG"
+          digest=$(sed -n 's/.*"containerimage.digest"[[:space:]]*:[[:space:]]*"\(sha256:[0-9a-f]*\)".*/\1/p' "$meta" | head -1)
+          [ -n "$digest" ] || { echo "no digest in the build metadata" >&2; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "reference=${REF%:*}@$digest" >> "$GITHUB_OUTPUT"
+          echo "\`$REF\` → \`${REF%:*}@$digest\`" | tee -a "$GITHUB_STEP_SUMMARY"
